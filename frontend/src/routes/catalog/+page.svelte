@@ -1,21 +1,41 @@
 <script lang="ts">
   /**
    * /catalog 印谱汇总与排序
-   * 收录状态切换、排序重编号、本地结构版本查看与 JSON 导入导出，并生成印谱清单。
+   * 按区段排定（拖动只改受影响范围）、保存前核对版本号、别处先动过则留草稿并重算落点、
+   * 正式序号分批推进、引用不全的条目先放待修区、写入失败恢复原顺序、大批量分批完成。
    * 消费 Catalog 及全部模型；复用 <StatBadge>、<EmptyPanel>、<GradeTag>。
    */
+  import { onMount } from 'svelte';
   import EmptyPanel from '$lib/components/common/EmptyPanel.svelte';
   import GradeTag from '$lib/components/common/GradeTag.svelte';
   import StatBadge from '$lib/components/common/StatBadge.svelte';
-  import { useIdbTable } from '$lib/hooks/useIdbTable';
   import { designs, loadDesigns } from '$lib/stores/designStore';
   import { carves, loadCarves } from '$lib/stores/carveStore';
   import { impressions, loadImpressions, bestImpressionOf } from '$lib/stores/impressionStore';
   import { loadStones, stones } from '$lib/stores/stoneStore';
   import {
+    baseVersion,
+    batchProgress,
+    createEntry,
+    discardDraft,
+    hasConflict,
+    hasDraft,
+    initCatalogStore,
+    moveEntry,
+    orderedCatalog,
+    pendingFixEntries,
+    refreshCatalog,
+    removeEntry,
+    repairEntry,
+    saveDraft,
+    saveNote as saveNoteStore,
+    saving,
+    setIncluded as setIncludedStore,
+    assignFormalNumbers,
+  } from '$lib/stores/catalogStore';
+  import {
     INCLUDED_COLOR,
     INCLUDED_OPTIONS,
-    createEmptyCatalogDraft,
     type Catalog,
     type IncludedStatus,
   } from '$lib/types/catalog';
@@ -28,6 +48,7 @@
     resetDatabase,
     writeLastBackupAt,
   } from '$lib/utils/db';
+  import { readCatalogVersion, writeCatalogVersion } from '$lib/utils/catalogOrder';
   import {
     buildCatalogText,
     copyText,
@@ -38,10 +59,6 @@
   } from '$lib/utils/export';
   import type { SealCarveSnapshot } from '$lib/utils/db';
 
-  // 印谱条目没有独立 store：本页通过 useIdbTable 的 liveQuery 订阅并完成全部读写
-  const catalogTable = useIdbTable<Catalog>((database) => database.catalogs, { sortByUpdatedAt: false });
-  const catalogRows = catalogTable.rows;
-
   let fileInput = $state<HTMLInputElement | null>(null);
   let lastBackupAt = $state<string | null>(readLastBackupAt());
   let toast = $state('');
@@ -50,8 +67,17 @@
   let newStoneId = $state('');
   let newDesignId = $state('');
   let newNote = $state('');
+  let dragId = $state('');
+  let repairing = $state<Catalog | null>(null);
+  let repairStoneId = $state('');
+  let repairDesignId = $state('');
 
-  const ordered = $derived([...$catalogRows].sort((a, b) => a.orderNo - b.orderNo));
+  onMount(() => {
+    void initCatalogStore();
+  });
+
+  const ordered = $derived($orderedCatalog);
+  const pendingFix = $derived($pendingFixEntries);
 
   const context = $derived({
     stones: $stones,
@@ -74,6 +100,9 @@
     $designs.filter((design) => !ordered.some((item) => item.designId === design.id)),
   );
   const designsOfNewStone = $derived(unlistedDesigns.filter((design) => design.stoneId === newStoneId));
+  const designsOfRepairStone = $derived(
+    $designs.filter((design) => design.stoneId === repairStoneId),
+  );
 
   $effect(() => {
     if (newStoneId.length === 0 && $stones.length > 0) newStoneId = $stones[0]?.id ?? '';
@@ -82,6 +111,13 @@
   $effect(() => {
     const first = designsOfNewStone[0];
     if (first && !designsOfNewStone.some((design) => design.id === newDesignId)) newDesignId = first.id;
+  });
+
+  $effect(() => {
+    const first = designsOfRepairStone[0];
+    if (first && !designsOfRepairStone.some((design) => design.id === repairDesignId)) {
+      repairDesignId = first.id;
+    }
   });
 
   function designText(designId: string): string {
@@ -98,35 +134,34 @@
     setTimeout(() => (toast = ''), 2600);
   }
 
-  async function move(entry: Catalog, delta: number): Promise<void> {
+  function move(entry: Catalog, delta: number): void {
     const list = ordered;
     const index = list.findIndex((item) => item.id === entry.id);
     const target = index + delta;
     if (index < 0 || target < 0 || target >= list.length) return;
-    const reordered = [...list];
-    const [moved] = reordered.splice(index, 1);
-    reordered.splice(target, 0, moved as Catalog);
-    const now = Date.now();
-    await catalogTable.bulkPut(reordered.map((item, position) => ({ ...item, orderNo: position + 1, updatedAt: now })));
-    showToast('排序已更新并重编号');
+    moveEntry(entry.id, list[target].id);
+  }
+
+  function handleDrop(targetId: string): void {
+    if (!dragId || dragId === targetId) {
+      dragId = '';
+      return;
+    }
+    moveEntry(dragId, targetId);
+    dragId = '';
   }
 
   async function setIncluded(entry: Catalog, included: IncludedStatus): Promise<void> {
-    await catalogTable.update(entry.id, { included });
+    await setIncludedStore(entry.id, included);
   }
 
   async function saveNote(entry: Catalog, note: string): Promise<void> {
-    await catalogTable.update(entry.id, { note });
+    await saveNoteStore(entry.id, note);
   }
 
   async function confirmDelete(): Promise<void> {
     if (!pendingDelete) return;
-    await catalogTable.remove(pendingDelete.id);
-    const rest = ordered.filter((item) => item.id !== pendingDelete?.id);
-    const now = Date.now();
-    if (rest.length > 0) {
-      await catalogTable.bulkPut(rest.map((item, index) => ({ ...item, orderNo: index + 1, updatedAt: now })));
-    }
+    await removeEntry(pendingDelete.id);
     pendingDelete = null;
     showToast('已删除并重编号');
   }
@@ -145,10 +180,41 @@
   async function submitNew(): Promise<void> {
     const design = $designs.find((item) => item.id === newDesignId);
     if (!design) return;
-    const draft = createEmptyCatalogDraft(design.stoneId, design.id, ordered.length + 1);
-    await catalogTable.create({ ...draft, note: newNote }, 'cata');
+    await createEntry(design.stoneId, design.id, newNote);
     dialogOpen = false;
     showToast(`已加入印谱：${design.sealText}`);
+  }
+
+  function openRepair(entry: Catalog): void {
+    repairing = entry;
+    repairStoneId = entry.stoneId || $stones[0]?.id || '';
+    repairDesignId = entry.designId || '';
+  }
+
+  async function submitRepair(): Promise<void> {
+    if (!repairing) return;
+    await repairEntry(repairing.id, repairStoneId, repairDesignId);
+    repairing = null;
+    showToast('条目已修复');
+  }
+
+  async function handleSaveDraft(): Promise<void> {
+    await saveDraft();
+    if ($hasConflict) {
+      showToast('印谱已在别处修改，已保留草稿并重算落点');
+    } else {
+      showToast('排序已保存');
+    }
+  }
+
+  function handleDiscardDraft(): void {
+    discardDraft();
+    showToast('已放弃草稿，恢复原顺序');
+  }
+
+  async function handleAssignFormalNumbers(): Promise<void> {
+    await assignFormalNumbers();
+    showToast('正式编号已完成');
   }
 
   async function handleExport(): Promise<void> {
@@ -180,14 +246,18 @@
     }
     if (!window.confirm('导入会清空当前浏览器中的全部档案，再写入备份内容，操作不可撤销。是否继续？')) return;
     await importSnapshot(parsed as SealCarveSnapshot);
-    await Promise.all([loadStones(), loadDesigns(), loadCarves(), loadImpressions(), catalogTable.refresh()]);
+    writeCatalogVersion(readCatalogVersion() + 1);
+    baseVersion.set(readCatalogVersion());
+    await Promise.all([loadStones(), loadDesigns(), loadCarves(), loadImpressions(), refreshCatalog()]);
     showToast('导入完成，数据已覆盖');
   }
 
   async function handleReset(): Promise<void> {
     if (!window.confirm('会删除当前浏览器中的全部档案并恢复演示数据，不可撤销。是否继续？')) return;
     await resetDatabase();
-    await Promise.all([loadStones(), loadDesigns(), loadCarves(), loadImpressions(), catalogTable.refresh()]);
+    writeCatalogVersion(readCatalogVersion() + 1);
+    baseVersion.set(readCatalogVersion());
+    await Promise.all([loadStones(), loadDesigns(), loadCarves(), loadImpressions(), refreshCatalog()]);
     showToast('已清空并重新载入演示数据');
   }
 </script>
@@ -205,6 +275,7 @@
       <button class="gb-btn" onclick={() => void handleExport()}>导出 JSON</button>
       <button class="gb-btn" onclick={() => fileInput?.click()}>导入 JSON</button>
       <button class="gb-btn-danger" onclick={() => void handleReset()}>清空重播种</button>
+      <button class="gb-btn" onclick={() => void handleAssignFormalNumbers()} disabled={$saving}>正式编号</button>
       <button class="gb-btn-primary" onclick={openCreate}>加入印谱</button>
       <input
         bind:this={fileInput}
@@ -220,11 +291,36 @@
     <div class="rounded-xl border border-jade/40 bg-jade/10 px-4 py-2 text-sm text-jade">{toast}</div>
   {/if}
 
+  {#if $hasConflict}
+    <div class="rounded-xl border border-seal/40 bg-seal/10 px-4 py-2 text-sm text-seal">
+      印谱已在别处修改，已保留草稿并重算落点。请确认顺序后保存。
+    </div>
+  {:else if $hasDraft}
+    <div class="flex flex-wrap items-center gap-3 rounded-xl border border-amber/40 bg-amber/10 px-4 py-2 text-sm text-amber">
+      <span>有未保存的排序草稿（仅改受影响范围）。</span>
+      <button class="gb-btn px-2 py-0.5" onclick={() => void handleSaveDraft()} disabled={$saving}>保存草稿</button>
+      <button class="gb-btn px-2 py-0.5" onclick={handleDiscardDraft} disabled={$saving}>放弃草稿</button>
+    </div>
+  {/if}
+
+  {#if $batchProgress}
+    <div class="rounded-xl border border-line bg-paper-light px-4 py-2 text-sm text-ink-soft">
+      正在分批处理：{$batchProgress.current} / {$batchProgress.total}
+      <div class="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-black/10">
+        <div
+          class="h-full rounded-full bg-seal transition-all"
+          style="width:{$batchProgress.total === 0 ? 0 : ($batchProgress.current / $batchProgress.total) * 100}%"
+        ></div>
+      </div>
+    </div>
+  {/if}
+
   <div class="flex flex-wrap gap-3">
     <StatBadge label="谱录条目" value={stat.total} suffix="方" tone="seal" />
     <StatBadge label="已收录" value={stat.included} suffix="方" tone="jade" />
     <StatBadge label="待收录" value={stat.pending} suffix="方" tone="amber" />
     <StatBadge label="不收录" value={stat.excluded} suffix="方" tone="ink" />
+    <StatBadge label="待修" value={pendingFix.length} suffix="方" tone="amber" />
     <StatBadge label="钤印总数" value={$impressions.length} suffix="次" />
   </div>
 
@@ -252,15 +348,22 @@
         <tbody>
           {#each ordered as entry, index (entry.id)}
             {@const best = bestImpressionOf(entry.designId)}
-            <tr>
+            <tr
+              class="{dragId === entry.id ? 'opacity-50' : ''} {$hasDraft ? 'bg-amber/5' : ''}"
+              draggable="true"
+              ondragstart={() => (dragId = entry.id)}
+              ondragover={(event) => event.preventDefault()}
+              ondrop={() => handleDrop(entry.id)}
+            >
               <td class="whitespace-nowrap">
                 <div class="flex items-center gap-1">
+                  <span class="cursor-grab text-ink-soft" title="按住拖动可调整顺序">⋮⋮</span>
                   <span class="tabular-nums">{entry.orderNo}</span>
-                  <button class="gb-btn px-2 py-0.5" disabled={index === 0} onclick={() => void move(entry, -1)}>↑</button>
+                  <button class="gb-btn px-2 py-0.5" disabled={index === 0} onclick={() => move(entry, -1)}>↑</button>
                   <button
                     class="gb-btn px-2 py-0.5"
                     disabled={index === ordered.length - 1}
-                    onclick={() => void move(entry, 1)}
+                    onclick={() => move(entry, 1)}
                   >
                     ↓
                   </button>
@@ -314,6 +417,57 @@
     </div>
   {/if}
 
+  {#if pendingFix.length > 0}
+    <section class="gb-panel border-amber/40">
+      <header class="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <h3 class="text-base text-amber">待修区（{pendingFix.length} 方 · 引用不完整，不参与排序）</h3>
+      </header>
+      <div class="overflow-x-auto">
+        <table class="gb-table">
+          <thead>
+            <tr>
+              <th>印文 / 释文</th>
+              <th class="w-40">印石</th>
+              <th class="w-40">问题</th>
+              <th class="w-40">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each pendingFix as entry (entry.id)}
+              <tr>
+                <td>{designText(entry.designId)}</td>
+                <td>{stoneText(entry.stoneId)}</td>
+                <td class="text-xs text-amber">
+                  {#if !$stones.some((s) => s.id === entry.stoneId) && !$designs.some((d) => d.id === entry.designId)}
+                    印石与印稿均已删除
+                  {:else if !$stones.some((s) => s.id === entry.stoneId)}
+                    印石已删除
+                  {:else}
+                    印稿已删除
+                  {/if}
+                </td>
+                <td>
+                  <div class="flex flex-wrap gap-1">
+                    <button class="gb-btn px-2 py-1" onclick={() => openRepair(entry)}>修复</button>
+                    <button
+                      class="gb-btn-danger px-2 py-1"
+                      onclick={async () => {
+                        await removeEntry(entry.id);
+                        showToast('已删除待修条目');
+                      }}
+                    >
+                      删除
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {/if}
+
   <div class="grid gap-4 xl:grid-cols-2">
     <section class="gb-panel">
       <header class="mb-2 flex flex-wrap items-center justify-between gap-2">
@@ -356,7 +510,7 @@
   </div>
 
   <p class="text-xs text-ink-soft">
-    排序调整后自动重编号（1…n）；收录状态分为「待收录 / 已收录 / 不收录」，印谱清单按排序号展开并附最佳钤印评级。
+    拖动或上下移仅调整受影响范围（from 与 to 之间），保存前核对印谱版本号；别处先动过则保留草稿并重算落点。正式序号分批推进，引用不完整的条目先放待修区。写入失败自动恢复原顺序。
   </p>
 </div>
 
@@ -395,12 +549,45 @@
   </div>
 {/if}
 
+{#if repairing}
+  <div class="fixed inset-0 z-50 grid place-items-center bg-black/40 px-4">
+    <div class="w-full max-w-lg rounded-xl border border-line bg-paper-light p-5 shadow-xl">
+      <h3 class="mb-3 text-lg text-ink">修复待修条目</h3>
+      <p class="mb-3 text-sm text-ink-soft">
+        该条目的印石或印稿引用已失效，请重新指定有效引用。
+      </p>
+      <div class="space-y-3">
+        <label class="block">
+          <span class="gb-label">印石</span>
+          <select class="gb-input" bind:value={repairStoneId}>
+            {#each $stones as stone (stone.id)}
+              <option value={stone.id}>{stone.name}</option>
+            {/each}
+          </select>
+        </label>
+        <label class="block">
+          <span class="gb-label">印稿</span>
+          <select class="gb-input" bind:value={repairDesignId}>
+            {#each designsOfRepairStone as design (design.id)}
+              <option value={design.id}>{design.sealText}（{design.annotation || '无释文'}）</option>
+            {/each}
+          </select>
+        </label>
+      </div>
+      <div class="mt-5 flex justify-end gap-2">
+        <button class="gb-btn" onclick={() => (repairing = null)}>取消</button>
+        <button class="gb-btn-primary" onclick={() => void submitRepair()}>确认修复</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 {#if pendingDelete}
   <div class="fixed inset-0 z-50 grid place-items-center bg-black/40 px-4">
     <div class="w-full max-w-md rounded-xl border border-line bg-paper-light p-5 shadow-xl">
       <h3 class="text-lg text-ink">删除谱录条目</h3>
       <p class="mt-2 text-sm text-ink-soft">
-        将把「{designText(pendingDelete.designId)}」移出印谱，其余条目自动重编号；印稿与钤印记录不受影响。
+        将把「{designText(pendingDelete.designId)}」移出印谱，其余条目分批重编号；印稿与钤印记录不受影响。
       </p>
       <div class="mt-5 flex justify-end gap-2">
         <button class="gb-btn" onclick={() => (pendingDelete = null)}>取消</button>
