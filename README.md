@@ -71,7 +71,7 @@ npm run preview    # 本地预览构建产物（http://localhost:22821）
 | `/#/designs` | 印稿设计与释文 | 朱文白文、边框式样与章法备注录入，标记采用稿（同石采用稿唯一） | Design、Stone |
 | `/#/carve` | 刻制工序看板 | 按印稿列出刀法步骤、拖拽或上下移排序、批量完成；全部完成回写印石为「已刻」 | Carve、Design |
 | `/#/impressions` | 钤印登记与效果比对 | 同稿多枚并列展示印泥、纸张、压力与评级，按评级择优并一键回填采用稿效果 | Impression、Design |
-| `/#/catalog` | 印谱汇总与导出 | 排序重编号、收录状态切换、印谱清单生成、JSON 导入导出与清空重播种 | Catalog 及全部模型 |
+| `/#/catalog` | 印谱汇总与导出 | 区段式拖拽排序（草稿暂存 + 保存前版本核对）、收录状态切换、印谱清单生成、JSON 导入导出与清空重播种 | Catalog 及全部模型 |
 
 未知路径由 `routes/NotFound.svelte` 给出友好空态（不白屏）。筛选条件写入 hash query（`?kw=&stoneType=&knobStyle=` 等），刷新后可完整还原。
 
@@ -85,7 +85,7 @@ npm run preview    # 本地预览构建产物（http://localhost:22821）
 | Design 印稿 | `src/lib/types/design.ts` | `id` `stoneId` `sealText` `annotation` `style`（朱文/白文） `borderStyle`（无框/双边/借边/瓦当） `layoutNote` `adopted` | 同石多稿，采用稿唯一，采用后带出到刻制与钤印 |
 | Carve 刻制工序 | `src/lib/types/carve.ts` | `id` `designId` `seq` `knifeMethod`（冲刀/切刀/双刀/修整） `minutes` `operator` `state`（未开始/进行中/已完成） | 拖拽调序，全部完成即回写印石为已刻 |
 | Impression 钤印记录 | `src/lib/types/impression.ts` | `id` `designId` `inkBrand` `paperType`（连史纸/宣纸/罗纹纸） `pressure`（轻/中/重） `grade`（优/良/一般/废） `stampedAt` | 同稿多次钤印按评级排序择优，可一键回填采用稿效果 |
-| Catalog 印谱条目 | `src/lib/types/catalog.ts` | `id` `stoneId` `designId` `orderNo` `included`（待收录/已收录/不收录） `note` | 调整排序后自动重编号并汇总已收录方数 |
+| Catalog 印谱条目 | `src/lib/types/catalog.ts` | `id` `stoneId` `designId` `orderNo` `included`（待收录/已收录/不收录） `note` | 按区段排定顺序：拖动只改受影响范围，正式序号分批写入 |
 
 数据结构版本号 `DB_VERSION` 定义在 `src/lib/utils/db.ts`，当前为 `v2`：`v1` 为初版五表结构；`v2` 补充 `stones.purchaseDate`、`designs.borderStyle`、`carves.operator`、`impressions.paperType`、`catalogs.included` 等索引，并在 Dexie `.upgrade()` 中回填历史记录缺失字段（`grade`、`adopted`、`borderStyle`、`orderNo`、`included`、`note`）。
 
@@ -99,10 +99,10 @@ sologsb101-1021/
 │   ├── src/
 │   │   ├── lib/
 │   │   │   ├── types/            # stone.ts design.ts carve.ts impression.ts catalog.ts
-│   │   │   ├── stores/           # stoneStore.ts designStore.ts carveStore.ts impressionStore.ts
+│   │   │   ├── stores/           # stoneStore.ts designStore.ts carveStore.ts impressionStore.ts catalogStore.ts
 │   │   │   ├── components/common/# GradeTag.svelte FilterBar.svelte StatBadge.svelte EmptyPanel.svelte
 │   │   │   ├── hooks/            # useCarveProgress.ts useIdbTable.ts
-│   │   │   ├── utils/            # stone.ts db.ts export.ts
+│   │   │   ├── utils/            # stone.ts db.ts export.ts catalogOrder.ts catalogDraft.ts
 │   │   │   └── router/           # index.ts（路由表 + 导航项）
 │   │   ├── routes/               # stones/+page.svelte designs/+page.svelte carve/+page.svelte
 │   │   │                         # impressions/+page.svelte catalog/+page.svelte NotFound.svelte
@@ -121,20 +121,35 @@ sologsb101-1021/
 └── README.md
 ```
 
-分层约定：页面组件只读 store 并调用导出的动作函数更新，跨页状态不留在组件内部；`useIdbTable()` 提供页面级 `liveQuery` 响应式订阅（`/catalog` 的印谱条目读写、`/stones` 的谱录方数统计均走它）。
+分层约定：页面组件只读 store 并调用导出的动作函数更新，跨页状态不留在组件内部；`useIdbTable()` 提供页面级 `liveQuery` 响应式订阅（`/catalog` 的印谱条目读取、`/stones` 的谱录方数统计均走它）。印谱排序写入统一走 `catalogStore`，纯计算在 `utils/catalogOrder.ts`，排序草稿暂存在 `utils/catalogDraft.ts`。
 
 ---
 
 ## 七、数据存储说明
 
 - **IndexedDB（Dexie，数据库名 `gbsealcarve`）**：5 张业务表 `stones` / `designs` / `carves` / `impressions` / `catalogs`，由 `src/lib/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Stone → Design → Carve / Impression，另有 Stone → Catalog，固定 id 如 `stone_01`、`design_0101`、`carve_010101`），播种幂等，保证每个页面打开都有内容。
-- **localStorage**：仅存元数据 —— `gbsealcarve:db-version`（本地结构版本）、`gbsealcarve:last-backup-at`（最近导出时间）、`gbsealcarve:ui-prefs`（当前印石 / 印稿）。
+- **localStorage**：仅存元数据 —— `gbsealcarve:db-version`（本地结构版本）、`gbsealcarve:last-backup-at`（最近导出时间）、`gbsealcarve:ui-prefs`（当前印石 / 印稿）、`gbsealcarve:catalog-order-draft`（未确认的印谱排序草稿，含版本核对底稿）。
 - **备份**：`/catalog` 页可导出 JSON（5 张表全量数据 + 结构版本号），导入时校验 `app` 字段与各集合数组完整性，覆盖导入前二次确认；另有印谱清单 TXT 与钤印台账 CSV。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 
 ---
 
-## 八、开发提示
+## 八、印谱区段排序的并发与恢复语义
+
+印谱收进上千方后，旧做法「整表重编号」会一次性写上千行、卡住页面；另一标签页同时改动还可能把新条目插进旧位置。`/catalog` 的排序按下述规则处理：
+
+1. **按区段排定**：拖动（HTML5 拖拽或 ↑↓）只重排起止位置之间的区段，落点先写入 localStorage 草稿（`catalogDraft.ts`），不触碰区段外的正式序号；页面上带 `*` 的为待保存位置。
+2. **保存前核对版本**：印谱版本取全部条目 `updatedAt` 的最大值，并同时核对条目 id 集合。库内版本/集合与草稿底稿不一致（另一标签页先动过）时，**不覆盖任何数据**：草稿保留并标记为冲突，按相对顺序自动重算落点（别处新增的条目补到队尾、已删条目丢弃），由作者核对后再次保存。
+3. **正式序号分批推进**：确认后只下发序号有变化的补丁，每批 80 条（`ORDER_BATCH_SIZE`）一个独立事务，批间 `requestAnimationFrame` 让出一帧并显示进度；单页改收录状态/备注会自动把未保存草稿的底稿前移，避免「自己顶掉自己」。
+4. **待修区**：引用不全（印石或印稿缺失）的条目不占正式序号、不进印谱清单，统一压到正式区尾号之后，在「待修区」面板提示补建引用或移出印谱。
+5. **失败恢复**：保存前对全表做快照；任一批写入失败，自动按快照分批恢复原顺序（含原 `updatedAt`），再向上报错。
+6. **清单口径**：印谱清单（TXT / 复制）始终按**确认后**的正式顺序展开，未保存的拖动调整与待修区条目不计入。
+
+纯计算（区段移动、受影响范围、补丁规划、分批切分）在 `src/lib/utils/catalogOrder.ts`，与 IndexedDB 解耦；写入口统一在 `src/lib/stores/catalogStore.ts`。
+
+---
+
+## 九、开发提示
 
 - 类型检查与构建：`cd frontend && npm run build`（含 `svelte-check`，必须零错误）。
 - 端口一致性：开发服务器（`vite.config.ts`）、预览服务、compose 的 `FRONTEND_PORT` 默认值均为 `22821`。

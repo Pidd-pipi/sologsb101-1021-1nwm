@@ -38,6 +38,8 @@ export interface UseIdbTableResult<T extends IdbRecord> {
   remove: (id: string) => Promise<void>;
   bulkRemove: (ids: string[]) => Promise<void>;
   bulkPut: (rows: T[]) => Promise<void>;
+  /** 在本表读写事务中执行一段逻辑，整体提交或整体回滚；返回事务内的计算结果 */
+  runTransaction: <R>(mode: 'rw' | 'r', worker: (txTable: Table<T, string>) => Promise<R> | R) => Promise<R>;
   clear: () => Promise<void>;
 }
 
@@ -122,6 +124,7 @@ export function useIdbTable<T extends IdbRecord>(
     bulkPut: async (list) => {
       await table.bulkPut(list);
     },
+    runTransaction: async (mode, worker) => db.transaction(mode, table, () => worker(table)),
     clear: async () => {
       await table.clear();
     },

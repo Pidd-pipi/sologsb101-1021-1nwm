@@ -351,24 +351,32 @@ export async function removeStoneCascade(stoneId: string): Promise<void> {
 
 /** 级联删除印稿 → 工序 / 钤印 / 印谱条目，并重编号印谱 */
 export async function removeDesignCascade(designId: string): Promise<void> {
-  const catalog = await db.catalogs.where('designId').equals(designId).toArray();
-  const stoneId = catalog[0]?.stoneId;
   await db.transaction('rw', [db.designs, db.carves, db.impressions, db.catalogs], async () => {
     await db.carves.where('designId').equals(designId).delete();
     await db.impressions.where('designId').equals(designId).delete();
     await db.catalogs.where('designId').equals(designId).delete();
     await db.designs.delete(designId);
   });
-  if (stoneId) await renumberCatalog(stoneId);
+  // orderNo 是印谱全局连续序号：删除后必须对全表重编号，不能只按 stone 分段，否则会编重
+  await renumberCatalog();
 }
 
-/** 印谱条目按序重编号（排序号连续） */
-export async function renumberCatalog(stoneId?: string): Promise<void> {
-  const rows = stoneId
-    ? await db.catalogs.where('stoneId').equals(stoneId).toArray()
-    : await db.catalogs.toArray();
+/**
+ * 印谱全表按序重编号（排序号连续）。
+ * 级联删除等场景的兜底：页面上的常规拖动排序只改受影响区段、走 catalogStore。
+ */
+export async function renumberCatalog(): Promise<void> {
+  const rows = await db.catalogs.toArray();
   const sorted = [...rows].sort((a, b) =>
     a.orderNo === b.orderNo ? a.createdAt - b.createdAt : a.orderNo - b.orderNo,
   );
-  await db.catalogs.bulkPut(sorted.map((row, index) => ({ ...row, orderNo: index + 1, updatedAt: Date.now() })));
+  const now = Date.now();
+  const patches = sorted
+    .map((row, index) => ({ row, orderNo: index + 1 }))
+    .filter(({ row, orderNo }) => row.orderNo !== orderNo)
+    .map(({ row, orderNo }) => ({ ...row, orderNo, updatedAt: now }));
+  if (patches.length === 0) return;
+  await db.transaction('rw', db.catalogs, async () => {
+    await db.catalogs.bulkPut(patches);
+  });
 }
